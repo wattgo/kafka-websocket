@@ -22,6 +22,7 @@ import kafka.javaapi.consumer.ConsumerConnector;
 import kafka.message.MessageAndMetadata;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import us.b3k.kafka.ws.messages.AbstractMessage;
 import us.b3k.kafka.ws.messages.BinaryMessage;
 import us.b3k.kafka.ws.messages.TextMessage;
 import us.b3k.kafka.ws.transforms.Transform;
@@ -34,12 +35,12 @@ import java.nio.charset.Charset;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 public class KafkaConsumer {
     private static Logger LOG = LoggerFactory.getLogger(KafkaConsumer.class);
 
-    private final ExecutorService executorService = Executors.newCachedThreadPool();
-
+    private final ExecutorService executorService;
     private final Transform transform;
     private final Session session;
     private final ConsumerConfig consumerConfig;
@@ -47,10 +48,20 @@ public class KafkaConsumer {
     private final List<String> topics;
     private final Async remoteEndpoint;
 
-    public KafkaConsumer(Properties configProps, final String topics, final Transform transform, final Session session) {
+    public KafkaConsumer(Properties configProps, final ExecutorService executorService, final Transform transform, final String topics, final Session session) {
         this.remoteEndpoint = session.getAsyncRemote();
         this.consumerConfig = new ConsumerConfig(configProps);
+        this.executorService = executorService;
         this.topics = Arrays.asList(topics.split(","));
+        this.transform = transform;
+        this.session = session;
+    }
+
+    public KafkaConsumer(ConsumerConfig consumerConfig, final ExecutorService executorService, final Transform transform, final List<String> topics, final Session session) {
+        this.remoteEndpoint = session.getAsyncRemote();
+        this.consumerConfig = consumerConfig;
+        this.executorService = executorService;
+        this.topics = topics;
         this.transform = transform;
         this.session = session;
     }
@@ -75,22 +86,18 @@ public class KafkaConsumer {
     }
 
     public void stop() {
-        LOG.debug("Stopping consumer for session {}", session.getId());
-        connector.commitOffsets();
-        try {
-            Thread.sleep(5000);
-        } catch (InterruptedException ie) {
-            LOG.error("Exception while waiting to shutdown consumer: {}", ie.getMessage());
-        }
+        LOG.info("Stopping consumer for session {}", session.getId());
         if (connector != null) {
-            LOG.trace("Shutting down connector for session {}", session.getId());
+            connector.commitOffsets();
+            try {
+                Thread.sleep(5000);
+            } catch (InterruptedException ie) {
+                LOG.error("Exception while waiting to shutdown consumer: {}", ie.getMessage());
+            }
+            LOG.debug("Shutting down connector for session {}", session.getId());
             connector.shutdown();
         }
-        if (executorService != null) {
-            LOG.trace("Shutting down executor for session {}", session.getId());
-            executorService.shutdown();
-        }
-        LOG.debug("Stopped consumer for session {}", session.getId());
+        LOG.info("Stopped consumer for session {}", session.getId());
     }
 
     static public class KafkaConsumerTask implements Runnable {
@@ -118,21 +125,35 @@ public class KafkaConsumer {
                     case "kafka-binary":
                         sendBinary(topic, message);
                         break;
-                    case "kafka-text":
+                    default:
                         sendText(topic, message);
                         break;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    try {
+                        session.close();
+                    } catch (IOException e) {
+                        LOG.error("Error terminating session: {}", e.getMessage());
+                    }
+                    return;
                 }
             }
         }
 
         private void sendBinary(String topic, byte[] message) {
-            remoteEndpoint.sendObject(transform.transform(new BinaryMessage(topic, message), session));
+            AbstractMessage msg = transform.transform(new BinaryMessage(topic, message), session);
+            if(!msg.isDiscard()) {
+                remoteEndpoint.sendObject(msg);
+            }
         }
 
         private void sendText(String topic, byte[] message) {
             String messageString = new String(message, Charset.forName("UTF-8"));
             LOG.trace("XXX Sending text message to remote endpoint: {} {}", topic, messageString);
-            remoteEndpoint.sendObject(transform.transform(new TextMessage(topic, messageString), session));
+            AbstractMessage msg = transform.transform(new TextMessage(topic, messageString), session);
+            if(!msg.isDiscard()) {
+                remoteEndpoint.sendObject(msg);
+            }
         }
 
         private void closeSession(Exception e) {
